@@ -1,0 +1,14 @@
+[project]
+name = "volctrl"
+version = "0.1.0"
+description = "Windows键盘音量控制工具"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pycaw",
+    "pynput",
+    "pystray",
+    "Pillow",
+    "comtypes",
+    "win10toast",
+]

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add VolCtrl.py README.md requirements.txt pyproject.toml .gitignore build.bat install.bat uninstall.bat VolCtrl.spec)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nfeat: VolCtrl - Windows键盘音量控制工具\n\n- 使用 pynput 实现高稳定性热键\n- 支持 Win+Alt+↑/↓/M 调节音量\n- 屏幕底部显示音量条\n- 开机自启动\n- 系统托盘驻留\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git pull --rebase origin main)",
+      "Bash(git push -u origin main)"
+    ]
+  }
+}

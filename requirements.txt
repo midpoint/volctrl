@@ -1,0 +1,6 @@
+pycaw
+pynput
+pystray
+Pillow
+comtypes
+win10toast
