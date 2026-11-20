@@ -15,8 +15,10 @@ import ctypes
 from ctypes import cast, POINTER
 
 try:
+    import comtypes
     from comtypes import CLSCTX_ALL
 except ImportError:
+    comtypes = None
     CLSCTX_ALL = None  # 兼容处理
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
@@ -244,76 +246,193 @@ class HotkeyManager:
         pass
 
 # ============== 音量控制类 ==============
+_com_local = threading.local()
+
+
+def _ensure_com():
+    """确保当前线程已初始化 COM。
+
+    pynput 热键回调和托盘菜单都可能在非主线程执行，而 comtypes 只在
+    导入它的线程里自动初始化 COM，这里按线程补一次初始化。
+    """
+    if getattr(_com_local, "ready", False):
+        return
+    if comtypes is not None:
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            # 该线程已经初始化过 COM（RPC_E_CHANGED_MODE）时忽略
+            pass
+    _com_local.ready = True
+
+
+def _get_default_device():
+    """获取当前默认播放设备，失败时返回 None"""
+    try:
+        return AudioUtilities.GetSpeakers()
+    except Exception as e:
+        print(f"获取默认音频设备失败: {e}")
+        return None
+
+
+def _get_device_id(device):
+    """获取设备 ID（兼容不同版本的 pycaw）"""
+    if device is None:
+        return None
+    device_id = getattr(device, "id", None)
+    if device_id:
+        return device_id
+    try:
+        return device.GetId()
+    except Exception:
+        return None
+
+
+def _create_endpoint_volume(device):
+    """从设备对象获取 IAudioEndpointVolume（兼容不同版本的 pycaw）"""
+    if device is None:
+        return None
+
+    # 新版 pycaw: AudioDevice.EndpointVolume
+    try:
+        endpoint = getattr(device, "EndpointVolume", None)
+    except Exception:
+        endpoint = None
+    if endpoint is not None:
+        return endpoint
+
+    # 部分版本: AudioDevice.endpoint / AudioDevice.interface
+    for attr in ("endpoint", "interface"):
+        endpoint = getattr(device, attr, None)
+        if endpoint is not None:
+            return endpoint
+
+    # 旧版 pycaw: IMMDevice.Activate
+    if hasattr(device, "Activate"):
+        if CLSCTX_ALL is not None:
+            interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        else:
+            interface = device.Activate(IAudioEndpointVolume._iid_, -1, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
+
+    return None
+
+
 class VolumeController:
     def __init__(self, hotkey_mgr=None):
         self.volume_bar = VolumeBar()
         self.hotkey_mgr = hotkey_mgr
+        self.volume = None       # 当前默认设备的 IAudioEndpointVolume
+        self._device_id = None   # self.volume 对应的设备 ID
+        self._lock = threading.RLock()
         self._init_audio()
-    
+
     def _init_audio(self):
         """初始化音频设备"""
-        try:
-            devices = AudioUtilities.GetSpeakers()
+        with self._lock:
+            device = _get_default_device()
+            if device is None:
+                print("音频初始化失败: 未找到默认播放设备")
+                return
+            self._device_id = _get_device_id(device)
+            self.volume = _create_endpoint_volume(device)
+            if self.volume is None:
+                print("音频初始化失败: 无法获取音量接口")
 
-            # 方式1: 尝试新版pycaw API (使用endpoint属性)
-            if hasattr(devices, 'endpoint'):
-                self.volume = devices.endpoint
-            # 方式2: 尝试通过interface属性
-            elif hasattr(devices, 'interface'):
-                self.volume = devices.interface
-            # 方式3: 尝试旧版Activate方法
-            elif CLSCTX_ALL:
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                self.volume = cast(interface, POINTER(IAudioEndpointVolume))
-            else:
-                # 方式4: 使用 -1 代替 CLSCTX_ALL
-                interface = devices.Activate(IAudioEndpointVolume._iid_, -1, None)
-                self.volume = cast(interface, POINTER(IAudioEndpointVolume))
+    def _ensure_volume(self):
+        """返回当前默认设备的音量接口。
 
-            self.mute = self.volume.GetMute()
-        except Exception as e:
-            print(f"音频初始化失败: {e}")
-            self.volume = None
-    
+        用户手动切换播放设备（声道）后，之前缓存的接口仍指向旧设备，
+        继续调节只会改旧设备的音量，听起来就是“音量控制失效”。
+        因此每次操作前检查默认设备 ID，发现变化就重新绑定。
+        """
+        _ensure_com()
+        with self._lock:
+            device = _get_default_device()
+
+            if device is None:
+                if self.volume is None:
+                    raise RuntimeError("没有可用的音频输出设备")
+                return self.volume  # 枚举暂时失败，继续用上一个接口
+
+            device_id = _get_device_id(device)
+            if (self.volume is not None and device_id is not None
+                    and device_id == self._device_id):
+                return self.volume
+
+            endpoint = _create_endpoint_volume(device)
+            if endpoint is None:
+                raise RuntimeError("无法获取默认播放设备的音量接口")
+            self.volume = endpoint
+            self._device_id = device_id
+            return self.volume
+
+    def _run_on_volume(self, action):
+        """在当前默认设备上执行操作；接口失效（设备切换/拔插）时重新绑定并重试"""
+        last_error = None
+        for _ in range(2):
+            try:
+                return action(self._ensure_volume())
+            except Exception as e:
+                last_error = e
+                with self._lock:
+                    self.volume = None  # 强制下次重新绑定
+        print(f"音量操作失败: {last_error}")
+        return None
+
+    @property
+    def mute(self):
+        """当前静音状态（实时读取，避免设备切换后缓存过期）"""
+        return self.is_muted()
+
+    def is_muted(self):
+        result = self._run_on_volume(lambda volume: bool(volume.GetMute()))
+        return bool(result)
+
     def get_volume(self):
         """获取当前音量 (0.0-1.0)"""
-        if self.volume:
-            return self.volume.GetMasterVolumeLevelScalar()
-        return 0.5
-    
+        result = self._run_on_volume(
+            lambda volume: volume.GetMasterVolumeLevelScalar())
+        if result is None:
+            return 0.5
+        return result
+
     def set_volume(self, value):
         """设置音量 (0.0-1.0)"""
-        if self.volume:
-            value = max(0.0, min(1.0, value))
-            self.volume.SetMasterVolumeLevelScalar(value, None)
-            return value
-        return None
-    
+        value = max(0.0, min(1.0, value))
+        return self._run_on_volume(lambda volume: self._apply_volume(volume, value))
+
+    @staticmethod
+    def _apply_volume(volume, value):
+        volume.SetMasterVolumeLevelScalar(value, None)
+        return value
+
     def increase_volume(self):
         """增加音量"""
-        current = self.get_volume()
-        new_vol = self.set_volume(current + VOLUME_STEP)
-        if new_vol:
-            self.volume_bar.show(new_vol, self.mute)
-        return new_vol
+        return self._change_volume(self.get_volume() + VOLUME_STEP)
 
     def decrease_volume(self):
         """减少音量"""
-        current = self.get_volume()
-        new_vol = self.set_volume(current - VOLUME_STEP)
-        if new_vol:
-            self.volume_bar.show(new_vol, self.mute)
+        return self._change_volume(self.get_volume() - VOLUME_STEP)
+
+    def _change_volume(self, target):
+        new_vol = self.set_volume(target)
+        if new_vol is not None:  # 0.0 也是有效音量，不能写成 if new_vol
+            self.volume_bar.show(new_vol, self.is_muted())
         return new_vol
 
     def toggle_mute(self):
         """切换静音状态"""
-        if self.volume:
-            self.mute = not self.mute
-            self.volume.SetMute(self.mute, None)
-            current_vol = self.get_volume()
-            self.volume_bar.show(current_vol, self.mute)
-            return self.mute
-        return None
+        new_mute = self._run_on_volume(self._toggle_mute)
+        if new_mute is not None:
+            self.volume_bar.show(self.get_volume(), new_mute)
+        return new_mute
+
+    @staticmethod
+    def _toggle_mute(volume):
+        new_mute = not bool(volume.GetMute())
+        volume.SetMute(new_mute, None)
+        return new_mute
 
 # ============== 系统通知 ==============
 def show_notification(message):
