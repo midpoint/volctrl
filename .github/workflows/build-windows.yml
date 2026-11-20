@@ -1,0 +1,52 @@
+name: Build Windows Portable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "VolCtrl.py"
+      - "VolCtrl.spec"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pycaw pynput pystray Pillow comtypes pyinstaller
+
+      - name: Build portable exe
+        run: |
+          python -m PyInstaller --clean --noconfirm --onefile --windowed `
+            --name VolCtrl `
+            --collect-all comtypes `
+            --hidden-import pynput.keyboard._win32 `
+            --hidden-import pynput.mouse._win32 `
+            --hidden-import pystray._win32 `
+            VolCtrl.py
+
+      - name: Package portable zip
+        run: |
+          Copy-Item README.md dist\README.md
+          Compress-Archive -Path dist\VolCtrl.exe, dist\README.md -DestinationPath dist\VolCtrl-portable.zip -Force
+          Get-Item dist\VolCtrl.exe, dist\VolCtrl-portable.zip | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VolCtrl-windows-portable
+          path: dist/VolCtrl-portable.zip
+          if-no-files-found: error
