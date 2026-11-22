@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 VolCtrl - Windows键盘音量控制工具
-功能：快捷键调节音量、开机自启、系统托盘驻留
+功能：快捷键调节音量、自定义热键、开机自启、系统托盘驻留
 """
 import sys
 import os
+import json
+import queue
 
 # PyInstaller 打包支持
 if getattr(sys, 'frozen', False):
@@ -36,12 +38,214 @@ import tkinter as tk
 APP_NAME = "VolCtrl"
 ICON_SIZE = 64
 VOLUME_STEP = 0.05  # 每次调节5%
-HOTKEY_UP = "win+alt+up"
-HOTKEY_DOWN = "win+alt+down"
-HOTKEY_MUTE = "win+alt+m"
 BAR_WIDTH = 300
 BAR_HEIGHT = 20
 BAR_DISPLAY_TIME = 1.5  # 音量条显示持续时间（秒）
+
+# 可自定义的热键动作：action -> 菜单显示名
+HOTKEY_ACTIONS = (
+    ("volume_up", "增大音量"),
+    ("volume_down", "减小音量"),
+    ("mute", "静音/取消静音"),
+)
+
+DEFAULT_HOTKEYS = {
+    "volume_up": "win+alt+up",
+    "volume_down": "win+alt+down",
+    "mute": "win+alt+m",
+}
+
+# ============== 热键字符串解析 ==============
+
+# 修饰键的规范名称与书写顺序
+MODIFIER_ORDER = ("win", "ctrl", "alt", "shift")
+MODIFIER_CANONICALS = frozenset(MODIFIER_ORDER)
+
+# 所有可以互换的修饰键写法（pynput 的 Key 名 / 用户输入的别名）
+_MODIFIER_ALIASES = {
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "ctrl_l": "ctrl",
+    "ctrl_r": "ctrl",
+    "alt": "alt",
+    "alt_l": "alt",
+    "alt_r": "alt",
+    "alt_gr": "alt",
+    "shift": "shift",
+    "shift_l": "shift",
+    "shift_r": "shift",
+    "win": "win",
+    "windows": "win",
+    "cmd": "win",
+    "cmd_l": "win",
+    "cmd_r": "win",
+    "super": "win",
+    "super_l": "win",
+    "super_r": "win",
+    "meta": "win",
+}
+
+# 主键别名
+_KEY_ALIASES = {
+    "escape": "esc",
+    "return": "enter",
+    "prior": "page_up",
+    "next": "page_down",
+    "pageup": "page_up",
+    "pagedown": "page_down",
+    "arrowup": "up",
+    "arrowdown": "down",
+    "arrowleft": "left",
+    "arrowright": "right",
+    "del": "delete",
+    "ins": "insert",
+    "spacebar": "space",
+}
+
+# 界面显示用的名称
+_DISPLAY_NAMES = {
+    "win": "Win",
+    "ctrl": "Ctrl",
+    "alt": "Alt",
+    "shift": "Shift",
+    "up": "↑",
+    "down": "↓",
+    "left": "←",
+    "right": "→",
+    "space": "Space",
+    "enter": "Enter",
+    "esc": "Esc",
+    "tab": "Tab",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "page_up": "PageUp",
+    "page_down": "PageDown",
+    "caps_lock": "CapsLock",
+    "num_lock": "NumLock",
+    "scroll_lock": "ScrollLock",
+    "print_screen": "PrtSc",
+    "pause": "Pause",
+    "menu": "Menu",
+}
+
+
+def _allowed_without_modifier(key):
+    """F1-F12、媒体键允许单独作为热键（普通按键单独使用会误触发）"""
+    if len(key) > 1 and key[0] == "f" and key[1:].isdigit():
+        return True
+    return key.startswith("media_")
+
+
+def parse_hotkey(hotkey_str):
+    """把 'Ctrl+Alt+Up' 之类的字符串解析为 (修饰键集合, 主键)。
+
+    无法解析或不满足约束（例如只有单个字母）时抛出 ValueError。
+    """
+    if not isinstance(hotkey_str, str):
+        raise ValueError("热键必须是字符串")
+
+    parts = [p.strip().lower() for p in hotkey_str.split("+")]
+    parts = [p for p in parts if p]
+    if not parts:
+        raise ValueError("热键为空")
+
+    mods = []
+    keys = []
+    for part in parts:
+        modifier = _MODIFIER_ALIASES.get(part)
+        if modifier:
+            if modifier not in mods:
+                mods.append(modifier)
+        else:
+            keys.append(_KEY_ALIASES.get(part, part))
+
+    if len(keys) != 1:
+        raise ValueError("热键必须且只能包含一个主键")
+    key = keys[0]
+    if not mods and not _allowed_without_modifier(key):
+        raise ValueError("热键至少需要一个修饰键（Ctrl/Alt/Shift/Win）")
+    return set(mods), key
+
+
+def format_hotkey(mods, key):
+    """按固定顺序拼成规范写法，例如 {'alt','win'}+up -> 'win+alt+up'"""
+    ordered = [m for m in MODIFIER_ORDER if m in mods]
+    ordered.append(key)
+    return "+".join(ordered)
+
+
+def normalize_hotkey(hotkey_str):
+    """校验并规范化为内部写法，非法时抛出 ValueError"""
+    mods, key = parse_hotkey(hotkey_str)
+    return format_hotkey(mods, key)
+
+
+def display_hotkey(hotkey_str):
+    """转换为界面显示写法，例如 'win+alt+up' -> 'Win+Alt+↑'"""
+    try:
+        mods, key = parse_hotkey(hotkey_str)
+    except ValueError:
+        return str(hotkey_str)
+
+    parts = [_DISPLAY_NAMES.get(m, m.capitalize())
+             for m in MODIFIER_ORDER if m in mods]
+    if len(key) == 1:
+        parts.append(key.upper())
+    elif key.startswith("f") and key[1:].isdigit():
+        parts.append(key.upper())
+    else:
+        parts.append(_DISPLAY_NAMES.get(key, key.replace("_", " ").title()))
+    return "+".join(parts)
+
+
+# ============== 配置文件 ==============
+def get_config_path():
+    """配置文件路径：%APPDATA%\\VolCtrl\\config.json"""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, APP_NAME, "config.json")
+
+
+def load_config():
+    """读取配置，文件缺失或损坏时使用默认值"""
+    config = {"hotkeys": dict(DEFAULT_HOTKEYS)}
+    path = get_config_path()
+    if not os.path.exists(path):
+        return config
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"⚠️ 读取配置失败，使用默认热键: {e}")
+        return config
+
+    hotkeys = data.get("hotkeys") if isinstance(data, dict) else None
+    if isinstance(hotkeys, dict):
+        for action, default in DEFAULT_HOTKEYS.items():
+            value = hotkeys.get(action)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                config["hotkeys"][action] = normalize_hotkey(value)
+            except ValueError as e:
+                print(f"⚠️ 配置热键 {action}='{value}' 无效（{e}），使用默认值 {default}")
+    return config
+
+
+def save_config(config):
+    """写入配置文件，返回实际路径"""
+    path = get_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    return path
+
+
+CONFIG = load_config()
+
 
 # ============== 音量条窗口 ==============
 class VolumeBar:
@@ -52,6 +256,8 @@ class VolumeBar:
         self.text = None
         self.hide_timer = None
         self._ready = False
+        # 从其他线程投递到 Tk 线程执行的任务队列
+        self._ui_queue = queue.Queue()
         # 在独立线程中启动tkinter
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -103,6 +309,31 @@ class VolumeBar:
         # 点击关闭
         self.root.bind("<Button-1>", lambda e: self.hide())
         self.root.withdraw()  # 初始隐藏
+
+        # 轮询跨线程 UI 任务
+        self.root.after(100, self._poll_ui_queue)
+
+    def _poll_ui_queue(self):
+        """在 Tk 线程中执行其他线程投递的任务"""
+        try:
+            while True:
+                func = self._ui_queue.get_nowait()
+                try:
+                    func()
+                except Exception as e:
+                    print(f"❌ UI 任务执行失败: {e}")
+        except queue.Empty:
+            pass
+
+        try:
+            if self.root and self.root.winfo_exists():
+                self.root.after(100, self._poll_ui_queue)
+        except Exception:
+            pass
+
+    def run_ui(self, func):
+        """线程安全地把任务交给 Tk 线程执行（用于打开设置窗口）"""
+        self._ui_queue.put(func)
 
     def show(self, volume, muted=False):
         """显示音量条"""
@@ -164,14 +395,21 @@ class VolumeBar:
             pass
 
 # ============== 热键管理 ==============
-# ============== Windows原生热键管理 ==============
-# ============== 热键管理 ==============
 class HotkeyManager:
+    """基于 pynput 的全局热键管理器。
+
+    热键写法：修饰键 + 主键，例如 'win+alt+up'、'ctrl+shift+m'。
+    修饰键支持 ctrl/control、alt、shift、win/cmd/super。
+    """
+
     def __init__(self):
-        self.callbacks = {}  # hotkey_str -> callback
+        self._bindings = {}      # 规范热键字符串 -> (修饰键集合, 主键, 回调)
         self._running = True
-        self._lock = threading.Lock()
+        self._suspended = False  # 打开设置窗口时暂停普通热键
+        self._lock = threading.RLock()
         self._pressed_keys = set()
+        self._capture_cb = None  # 捕获热键时的回调
+        self._capturing = False
         self._listener = None
 
         # 启动键盘监听器
@@ -181,69 +419,141 @@ class HotkeyManager:
         """启动键盘监听器"""
         def on_press(key):
             try:
-                key_str = self._get_key_str(key)
-                if key_str:
-                    self._pressed_keys.add(key_str)
-                    self._check_hotkeys()
-            except:
-                pass
+                raw = self._raw_key_token(key)
+            except Exception:
+                return
+            if not raw:
+                return
+
+            with self._lock:
+                self._pressed_keys.add(raw)
+                capturing = self._capturing
+                suspended = self._suspended
+
+            if capturing:
+                self._capture_press(raw)
+                return
+            if suspended:
+                return
+            self._trigger(raw)
 
         def on_release(key):
             try:
-                key_str = self._get_key_str(key)
-                if key_str:
-                    self._pressed_keys.discard(key_str)
-            except:
-                pass
+                raw = self._raw_key_token(key)
+            except Exception:
+                return
+            if raw:
+                with self._lock:
+                    self._pressed_keys.discard(raw)
 
         self._listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
         self._listener.start()
 
-    def _get_key_str(self, key):
-        if hasattr(key, 'char') and key.char:
-            return key.char.lower()
-        return str(key)
+    @staticmethod
+    def _raw_key_token(key):
+        """把 pynput 的按键对象转成统一的字符串 token"""
+        char = getattr(key, "char", None)
+        if char:
+            return char.lower()
+        if isinstance(key, KeyCode):
+            return ""
+        name = str(key)
+        if name.startswith("Key."):
+            name = name[4:]
+        return name.lower()
 
-    def _check_hotkeys(self):
-        for hotkey_str, callback in self.callbacks.items():
-            if self._match_hotkey(hotkey_str):
-                try:
-                    callback()
-                except:
-                    pass
+    @staticmethod
+    def _canonical_key(token):
+        """把原始 token 规范化为内部名称（cmd_l -> win, escape -> esc）"""
+        modifier = _MODIFIER_ALIASES.get(token)
+        if modifier:
+            return modifier
+        return _KEY_ALIASES.get(token, token)
 
-    def _match_hotkey(self, hotkey_str):
-        keys = hotkey_str.lower().split('+')
-        keys = [k.strip() for k in keys]
-
-        for key in keys:
-            if key == 'win':
-                if not any('cmd' in k or 'win' in k for k in self._pressed_keys):
-                    return False
-            elif key == 'alt':
-                if not any('alt' in k for k in self._pressed_keys):
-                    return False
-            elif key == 'up':
-                if 'Key.up' not in self._pressed_keys:
-                    return False
-            elif key == 'down':
-                if 'Key.down' not in self._pressed_keys:
-                    return False
-            elif key == 'm':
-                if 'm' not in self._pressed_keys:
-                    return False
-            else:
-                if key not in self._pressed_keys:
-                    return False
-        return True
+    @staticmethod
+    def _pressed_modifiers(pressed):
+        mods = set()
+        for token in pressed:
+            modifier = _MODIFIER_ALIASES.get(token)
+            if modifier:
+                mods.add(modifier)
+        return mods
 
     def register(self, hotkey_str, callback):
+        """注册热键；无法解析时抛出 ValueError"""
+        mods, key = parse_hotkey(hotkey_str)
+        canonical = format_hotkey(mods, key)
         with self._lock:
-            self.callbacks[hotkey_str] = callback
-            print(f"✅ 注册热键: {hotkey_str}")
+            self._bindings[canonical] = (set(mods), key, callback)
+        print(f"✅ 注册热键: {display_hotkey(canonical)}")
 
-    def refresh(self):
-        pass
+    def clear(self):
+        """清空所有已注册热键"""
+        with self._lock:
+            self._bindings.clear()
+
+    def _trigger(self, raw):
+        """当前按下的键是主键时，检查是否匹配某个热键"""
+        key = self._canonical_key(raw)
+        if key in MODIFIER_CANONICALS:
+            return
+
+        with self._lock:
+            pressed = set(self._pressed_keys)
+            bindings = list(self._bindings.values())
+
+        mods = self._pressed_modifiers(pressed)
+        for hot_mods, hot_key, callback in bindings:
+            # 修饰键要求完全一致，避免 'alt+up' 被 'ctrl+alt+up' 意外触发
+            if hot_key == key and hot_mods == mods:
+                try:
+                    callback()
+                except Exception as e:
+                    print(f"❌ 执行热键回调失败: {e}")
+                break
+
+    def begin_capture(self, callback):
+        """进入热键捕获模式，捕获结果通过 callback(热键字符串或 None) 返回"""
+        with self._lock:
+            self._capture_cb = callback
+            self._capturing = True
+            self._pressed_keys.clear()
+
+    def cancel_capture(self):
+        """取消捕获"""
+        self._finish_capture(None)
+
+    def _capture_press(self, raw):
+        key = self._canonical_key(raw)
+        if key in MODIFIER_CANONICALS:
+            return  # 只按了修饰键，继续等待主键
+
+        with self._lock:
+            pressed = set(self._pressed_keys)
+        mods = self._pressed_modifiers(pressed)
+
+        if key == "esc" and not mods:
+            self._finish_capture(None)  # 单独按 Esc 取消
+            return
+        if not mods and not _allowed_without_modifier(key):
+            return  # 普通按键必须搭配修饰键，继续等待
+
+        self._finish_capture(format_hotkey(mods, key))
+
+    def _finish_capture(self, hotkey):
+        with self._lock:
+            callback = self._capture_cb
+            self._capture_cb = None
+            self._capturing = False
+        if callback:
+            try:
+                callback(hotkey)
+            except Exception as e:
+                print(f"❌ 处理捕获结果失败: {e}")
+
+    def set_suspended(self, suspended):
+        """暂停/恢复普通热键响应（设置窗口打开期间）"""
+        self._suspended = bool(suspended)
 
 # ============== 音量控制类 ==============
 _com_local = threading.local()
@@ -434,6 +744,163 @@ class VolumeController:
         volume.SetMute(new_mute, None)
         return new_mute
 
+# ============== 热键设置窗口 ==============
+class HotkeySettingsDialog:
+    """Tk 设置窗口：点击「修改」后按下新的组合键即可重新绑定。"""
+
+    def __init__(self, master, hotkey_mgr, on_saved):
+        self.hotkey_mgr = hotkey_mgr
+        self.on_saved = on_saved
+        self.values = dict(CONFIG["hotkeys"])
+        self.capturing = None
+        self._results = queue.Queue()
+        self._value_labels = {}
+        self._buttons = {}
+        self._closed = False
+
+        self.win = tk.Toplevel(master)
+        self.win.title(f"{APP_NAME} - 热键设置")
+        self.win.resizable(False, False)
+        self.win.attributes("-topmost", True)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        container = tk.Frame(self.win, padx=16, pady=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(container, text="点击「修改」后按下新的快捷键组合",
+                 anchor="w").pack(fill=tk.X, pady=(0, 8))
+
+        for action, title in HOTKEY_ACTIONS:
+            row = tk.Frame(container)
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+
+            value_label = tk.Label(
+                row, text=display_hotkey(self.values[action]),
+                width=20, anchor="w", relief="groove")
+            value_label.pack(side=tk.LEFT, padx=(0, 8))
+            self._value_labels[action] = value_label
+
+            button = tk.Button(row, text="修改", width=8,
+                               command=lambda a=action: self.start_capture(a))
+            button.pack(side=tk.LEFT)
+            self._buttons[action] = button
+
+        self.status_var = tk.StringVar(value="")
+        tk.Label(container, textvariable=self.status_var, fg="#666",
+                 anchor="w").pack(fill=tk.X, pady=(8, 6))
+
+        buttons = tk.Frame(container)
+        buttons.pack(fill=tk.X)
+        tk.Button(buttons, text="恢复默认",
+                  command=self.reset_defaults).pack(side=tk.LEFT)
+        tk.Button(buttons, text="保存", width=8,
+                  command=self.save).pack(side=tk.RIGHT)
+        tk.Button(buttons, text="取消", width=8,
+                  command=self.close).pack(side=tk.RIGHT)
+
+        self.win.update_idletasks()
+        self._center()
+        self.hotkey_mgr.set_suspended(True)
+        self.win.after(50, self._poll)
+        self.win.lift()
+        self.win.focus_force()
+
+    def _center(self):
+        width = self.win.winfo_width()
+        height = self.win.winfo_height()
+        screen_w = self.win.winfo_screenwidth()
+        screen_h = self.win.winfo_screenheight()
+        x = (screen_w - width) // 2
+        y = (screen_h - height) // 2
+        self.win.geometry(f"+{x}+{y}")
+
+    def _poll(self):
+        """轮询键盘线程投递的捕获结果"""
+        if self._closed:
+            return
+        try:
+            while True:
+                result = self._results.get_nowait()
+                self._finish_capture(result)
+        except queue.Empty:
+            pass
+        if not self._closed:
+            self.win.after(50, self._poll)
+
+    def start_capture(self, action):
+        if self.capturing or self._closed:
+            return
+        self.capturing = action
+        self._buttons[action].config(text="按键…", state=tk.DISABLED)
+        self.status_var.set("请按下新的快捷键组合（至少一个修饰键，Esc 取消）")
+        self.win.focus_force()
+        self.hotkey_mgr.begin_capture(lambda hk: self._results.put(hk))
+
+    def _finish_capture(self, hotkey):
+        action = self.capturing
+        self.capturing = None
+        if action is None:
+            return
+
+        self._buttons[action].config(text="修改", state=tk.NORMAL)
+        if hotkey is None:
+            self.status_var.set("已取消修改")
+            return
+
+        for other, title in HOTKEY_ACTIONS:
+            if other != action and self.values.get(other) == hotkey:
+                self.status_var.set(f"该组合已被「{title}」占用，请换一个")
+                return
+
+        self.values[action] = hotkey
+        self._value_labels[action].config(text=display_hotkey(hotkey))
+        self.status_var.set(f"已设置为 {display_hotkey(hotkey)}，点击「保存」生效")
+
+    def reset_defaults(self):
+        if self.capturing:
+            self.hotkey_mgr.cancel_capture()
+            self._finish_capture(None)
+        self.values = dict(DEFAULT_HOTKEYS)
+        for action, _ in HOTKEY_ACTIONS:
+            self._value_labels[action].config(
+                text=display_hotkey(self.values[action]))
+        self.status_var.set("已恢复默认热键，点击「保存」生效")
+
+    def save(self):
+        if self.capturing:
+            self.hotkey_mgr.cancel_capture()
+            self._finish_capture(None)
+
+        new_config = {"hotkeys": dict(self.values)}
+        try:
+            path = save_config(new_config)
+        except Exception as e:
+            self.status_var.set(f"保存失败: {e}")
+            return
+
+        CONFIG["hotkeys"] = new_config["hotkeys"]
+        try:
+            self.on_saved()
+        except Exception as e:
+            self.status_var.set(f"应用热键失败: {e}")
+            return
+
+        print(f"✅ 热键配置已保存: {path}")
+        self.close()
+
+    def close(self):
+        if self._closed:
+            return
+        if self.capturing:
+            self.hotkey_mgr.cancel_capture()
+        self.hotkey_mgr.set_suspended(False)
+        self._closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
 # ============== 系统通知 ==============
 def show_notification(message):
     """显示Windows通知"""
@@ -450,11 +917,11 @@ def create_volume_icon(volume_level=50):
     """创建音量图标"""
     img = Image.new('RGBA', (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    
+
     # 颜色
     bg_color = (0, 120, 212, 255)  # 蓝色
     fg_color = (255, 255, 255, 255)
-    
+
     # 画喇叭图形
     # 外圈
     draw.ellipse([8, 20, 24, 44], outline=fg_color, width=3)
@@ -465,47 +932,90 @@ def create_volume_icon(volume_level=50):
     for i in range(bar_count):
         x = 40 + i * 6
         draw.line([(x, 30 - i*3), (x, 34 + i*3)], fill=fg_color, width=2)
-    
+
     return img
 
-# 全局变量用于热键刷新
+# 全局变量用于托盘菜单/设置窗口
 _hotkey_mgr = None
 _volume_ctrl = None
 
-def refresh_hotkeys():
-    """刷新显示（pynput 监听器持续工作）"""
-    global _hotkey_mgr, _volume_ctrl
-    if _hotkey_mgr and _volume_ctrl:
+
+def apply_hotkeys(hotkey_mgr, volume_ctrl):
+    """按当前配置注册热键（会清空旧绑定）"""
+    callbacks = {
+        "volume_up": volume_ctrl.increase_volume,
+        "volume_down": volume_ctrl.decrease_volume,
+        "mute": volume_ctrl.toggle_mute,
+    }
+    hotkey_mgr.clear()
+    for action, callback in callbacks.items():
+        hotkey = CONFIG["hotkeys"].get(action) or DEFAULT_HOTKEYS[action]
         try:
-            current_vol = _volume_ctrl.get_volume()
-            _volume_ctrl.volume_bar.show(current_vol, _volume_ctrl.mute)
-            print("✅ 音量条已显示")
-        except Exception as e:
-            print(f"❌ 刷新失败: {e}")
+            hotkey_mgr.register(hotkey, callback)
+        except ValueError as e:
+            default = DEFAULT_HOTKEYS[action]
+            print(f"⚠️ 热键「{hotkey}」无效（{e}），改用默认 {default}")
+            CONFIG["hotkeys"][action] = default
+            hotkey_mgr.register(default, callback)
+
+
+def reload_config():
+    """从磁盘重新读取配置并应用"""
+    new_config = load_config()
+    CONFIG["hotkeys"] = new_config["hotkeys"]
+    if _hotkey_mgr and _volume_ctrl:
+        apply_hotkeys(_hotkey_mgr, _volume_ctrl)
+    print("✅ 已重新加载热键配置")
+
+
+def _menu_label(prefix, action):
+    """生成动态菜单文字，打开托盘菜单时读取最新热键"""
+    def text(item):
+        hotkey = CONFIG["hotkeys"].get(action, DEFAULT_HOTKEYS[action])
+        return f"{prefix} ({display_hotkey(hotkey)})"
+    return text
+
 
 def setup_tray(volume_ctrl):
     """设置系统托盘"""
     icon_image = create_volume_icon(int(volume_ctrl.get_volume() * 100))
 
-    def on_click(icon, item):
-        if str(item) == "退出":
-            volume_ctrl.volume_bar.destroy()
-            if _hotkey_mgr:
-                _hotkey_mgr._running = False
-            icon.stop()
-            os._exit(0)
+    def on_settings(icon, item):
+        if _hotkey_mgr is None or volume_ctrl.volume_bar.root is None:
+            return
+
+        def open_dialog():
+            bar = volume_ctrl.volume_bar
+            existing = getattr(bar, "_settings_dialog", None)
+            if existing is not None and not existing._closed:
+                existing.win.lift()
+                existing.win.focus_force()
+                return
+            bar._settings_dialog = HotkeySettingsDialog(
+                bar.root, _hotkey_mgr,
+                lambda: apply_hotkeys(_hotkey_mgr, volume_ctrl))
+
+        volume_ctrl.volume_bar.run_ui(open_dialog)
+
+    def on_exit(icon, item):
+        volume_ctrl.volume_bar.destroy()
+        if _hotkey_mgr:
+            _hotkey_mgr._running = False
+        icon.stop()
+        os._exit(0)
 
     menu = Menu(
         MenuItem("显示音量", lambda icon, item: volume_ctrl.volume_bar.show(volume_ctrl.get_volume(), volume_ctrl.mute)),
-        MenuItem("增大 (Win+Alt+↑)", lambda icon, item: volume_ctrl.increase_volume()),
-        MenuItem("减小 (Win+Alt+↓)", lambda icon, item: volume_ctrl.decrease_volume()),
-        MenuItem("静音 (Win+Alt+M)", lambda icon, item: volume_ctrl.toggle_mute()),
+        MenuItem(_menu_label("增大", "volume_up"), lambda icon, item: volume_ctrl.increase_volume()),
+        MenuItem(_menu_label("减小", "volume_down"), lambda icon, item: volume_ctrl.decrease_volume()),
+        MenuItem(_menu_label("静音", "mute"), lambda icon, item: volume_ctrl.toggle_mute()),
         MenuItem("---", lambda icon, item: None),
-        MenuItem("重新注册热键", lambda icon, item: refresh_hotkeys()),
+        MenuItem("设置热键…", on_settings),
+        MenuItem("重新加载热键配置", lambda icon, item: reload_config()),
         MenuItem("---", lambda icon, item: None),
-        MenuItem("退出", on_click)
+        MenuItem("退出", on_exit)
     )
-    
+
     icon = Icon(APP_NAME, icon_image, APP_NAME, menu)
     icon.run_detached()
 
@@ -521,9 +1031,9 @@ def install_startup():
     """添加开机自启动"""
     try:
         exe_path = get_exe_path()
-        
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
-                            r"Software\Microsoft\Windows\CurrentVersion\Run", 
+
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
         winreg.CloseKey(key)
@@ -548,19 +1058,24 @@ def uninstall_startup():
 
 # ============== 主程序 ==============
 def main():
+    global _hotkey_mgr, _volume_ctrl
+
+    up = display_hotkey(CONFIG["hotkeys"]["volume_up"])
+    down = display_hotkey(CONFIG["hotkeys"]["volume_down"])
+    mute = display_hotkey(CONFIG["hotkeys"]["mute"])
     print(f"""
-╔══════════════════════════════════╗
-║     {APP_NAME} - 键盘音量控制器       ║
-╠══════════════════════════════════╣
-║  Win + Alt + ↑  增加音量          ║
-║  Win + Alt + ↓  减少音量          ║
-║  Win + Alt + M  静音/取消静音     ║
-║  右键托盘图标  退出程序            ║
-╚══════════════════════════════════╝
+=====================================
+  {APP_NAME} - 键盘音量控制器
+=====================================
+  {up}  增大音量
+  {down}  减小音量
+  {mute}  静音/取消静音
+  右键托盘图标可修改热键或退出
+=====================================
+配置文件: {get_config_path()}
     """)
 
     # 初始化热键管理器
-    global _hotkey_mgr, _volume_ctrl
     hotkey_mgr = HotkeyManager()
 
     # 初始化音量控制器（传入热键管理器）
@@ -571,10 +1086,8 @@ def main():
     # 等待键盘钩子初始化
     time.sleep(0.5)
 
-    # 注册快捷键
-    hotkey_mgr.register(HOTKEY_UP, volume_ctrl.increase_volume)
-    hotkey_mgr.register(HOTKEY_DOWN, volume_ctrl.decrease_volume)
-    hotkey_mgr.register(HOTKEY_MUTE, volume_ctrl.toggle_mute)
+    # 注册快捷键（来自配置文件）
+    apply_hotkeys(hotkey_mgr, volume_ctrl)
 
     # 启动热键守护线程（pynput 不需要刷新，保持进程活跃）
     def hotkey_watchdog():
@@ -583,10 +1096,10 @@ def main():
             # pynput 监听器自动工作，只需确认还在运行
     watchdog_thread = threading.Thread(target=hotkey_watchdog, daemon=True)
     watchdog_thread.start()
-    
+
     # 设置托盘图标
     setup_tray(volume_ctrl)
-    
+
     # 尝试安装开机自启动
     if "--install" in sys.argv:
         install_startup()
@@ -595,19 +1108,11 @@ def main():
     else:
         # 首次运行自动安装
         install_startup()
-    
-    print(f"✅ {APP_NAME} 已启动，快捷键已注册")
 
-    # 检查是否以管理员权限运行
-    try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        if not is_admin:
-            print("⚠️ 警告：建议以管理员权限运行以确保热键稳定工作")
-    except:
-        pass
-    print("💡 提示：如遇热键失效，可右键托盘图标选择'重新注册热键'")
+    print(f"✅ {APP_NAME} 已启动，快捷键已注册")
+    print("💡 提示：右键托盘图标选择「设置热键…」可自定义快捷键")
     print("按 Ctrl+C 退出")
-    
+
     # 保持运行
     try:
         while True:
