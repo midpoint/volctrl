@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -45,7 +45,7 @@ jobs:
           Get-Item dist\VolCtrl.exe, dist\VolCtrl-portable.zip | Select-Object Name, Length
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VolCtrl-windows-portable
           path: dist/VolCtrl-portable.zip
